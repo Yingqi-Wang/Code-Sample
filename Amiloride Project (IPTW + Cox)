@@ -79,13 +79,12 @@ run;
 
 %let PS_CONT = age ip_adm op_visits;
 %let PS_BIN  = sex_binary Race_NHB Race_Hisp Race_Other
-               idxyr_2016 idxyr_2017 idxyr_2018 idxyr_2019
+               idxyr_2017 idxyr_2018 idxyr_2019
                cci_mi cci_chf cci_pvd cci_cvd cci_copd cci_dm cci_dmcx
                cci_renal cci_malig cci_mets cci_liver_mild cci_liver_sev
                ht_dx med_antipsych med_antidepressant med_beta;
 
 proc logistic data=cms.cohort_psweights desc;
-  class &PS_BIN / param=ref;
   model Ami_1px = &PS_CONT &PS_BIN;
   output out=ps_denom p=ps;                /* predicted P(treated) */
   title 'Propensity score model: P(Amiloride | covariates)';
@@ -240,7 +239,7 @@ run;
 
 /* Unweighted Cox (crude HR) */
 proc phreg data=cms.ami_pd_analysis;
-  class Ami_1px(ref='0') / param=ref order=internal;
+  class Ami_1px(ref=0) / param=ref order=internal;
   model days_to_end_fu*censor_flag_pd(0) = Ami_1px;
   hazardratio 'Unweighted HR: Amiloride vs Other PS' Ami_1px / diff=ref cl=wald;
   title 'Cox PH — Unweighted';
@@ -248,7 +247,7 @@ run;
 
 /* 6b. IPTW-weighted Cox (trimmed) */
 proc phreg data=cms.ami_pd_analysis;
-  class Ami_1px(ref='0') / param=ref order=internal;
+  class Ami_1px(ref=0) / param=ref order=internal covsandwich;
   model days_to_end_fu*censor_flag_pd(0) = Ami_1px;
   weight sipew_t / normalize;
   hazardratio 'IPTW (trimmed) HR: Amiloride vs Other PS' Ami_1px / diff=ref cl=wald;
@@ -259,7 +258,7 @@ run;
 /***** ----- Step 7. Proportional hazards diagnostics ----- *****/
 /* Schoenfeld residuals for Ami_1px under weighted model */
 proc phreg data=cms.ami_pd_analysis;
-  class Ami_1px(ref='0') / param=ref order=internal;
+  class Ami_1px(ref=0) / param=ref order=internal;
   model days_to_end_fu*censor_flag_pd(0) = Ami_1px;
   weight sipew_t;
   output out=cms.schoen_pd ressch=ressch_Ami;

@@ -1,0 +1,15 @@
+*******************************************************************************;
+* Program name      :	xx_propensity_score_weights
+* Author            :	Jamie Heyward
+* Date created      :	July 11 2022
+* Study             : 	
+* Purpose           :	Calculate propensity score weights to ensure covariate balance between Ami exposure arms.
+* Inputs            :	
+* Program completed : 	
+* Updated by        : Yingqi Wang
+*********************************************************************************;
+
+/* Step 1. Create analysis set + dummy variables (style-matched) */
+data cms.cohort_psweights;
+  set cms.cohort_base_ami_pd;
+

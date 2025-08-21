@@ -1,0 +1,290 @@
+*******************************************************************************;
+* Program name      :	xx_propensity_score_weights
+* Author            :	Jamie Heyward
+* Date created      :	July 11 2022
+* Study             : 	
+* Purpose           :	Calculate propensity score weights to ensure covariate balance between Ami exposure arms.
+* Inputs            :	
+* Program completed : 	
+* Updated by        : Yingqi Wang
+*********************************************************************************;
+
+/* ----- Step 1. Create analysis set + dummy variables (style-matched) ----- */
+
+data cms.cohort_psweights;
+  set cms.cohort_base_ami_pd;
+
+/* Exposure: 1 = Amiloride, 0 = Other PS diuretics */
+  format Ami_1px 1.;
+  label  Ami_1px = 'Exposure (1=Amiloride, 0=Other PS)';
+
+/* Example dummy variables (adjust to your data dictionary) */
+  sex_binary   = (sex = 1);                 /* 1=Male, 0=Female */
+
+  Race_NHW     = (race = 1);
+  Race_NHB     = (race = 2);
+  Race_Hisp    = (race = 5);
+  Race_Other   = (race = 4);
+
+  /* Index year dummies (2016–2019) */
+  idxyr_2016 = (year(index_dt)=2016);
+  idxyr_2017 = (year(index_dt)=2017);
+  idxyr_2018 = (year(index_dt)=2018);
+  idxyr_2019 = (year(index_dt)=2019);
+
+  /* Charlson components / comorbidities (already 0/1)*/
+  cci_mi  = cci_mi;
+  cci_chf = cci_chf;
+  cci_pvd = cci_pvd;
+  cci_cvd = cci_cvd;
+  cci_copd= cci_copd;
+  cci_dm  = cci_dm;
+  cci_dmcx= cci_dmcx;
+  cci_renal = cci_renal;
+  cci_malig = cci_malig;
+  cci_mets  = cci_mets;
+  cci_liver_mild = cci_liver_mild;
+  cci_liver_sev  = cci_liver_sev;
+
+  /* Other Comorbidities */
+  ht_dx = ht_dx;                     /* hypertension */
+
+  /* Health service utilization (Continuous Variable) */
+  ip_adm     = ip_adm;               /* inpatient admissions */
+  op_visits  = op_visits;            /* outpatient visits */
+
+  /* Co-medications */
+  med_antipsych = med_antipsych;
+  med_antidepressant = med_antidepressant;
+  med_beta = med_beta;
+run;
+
+
+/* QC summaries */
+proc freq  data=cms.cohort_psweights;
+  tables Ami_1px*(sex_binary Race_NHW Race_NHB Race_Hisp Race_Other
+                  idxyr_2016 idxyr_2017 idxyr_2018 idxyr_2019
+                  cci_mi cci_chf cci_pvd cci_cvd cci_copd cci_dm cci_dmcx
+                  cci_renal cci_malig cci_mets cci_liver_mild cci_liver_sev
+                  ht_dx med_antipsych med_antidepressant med_beta);
+run;
+
+proc means data=cms.cohort_psweights;
+  class Ami_1px;
+  var age ip_adm op_visits;
+run;
+
+
+/* ----- Step 2. Propensity Score model (binary logistic) ----- */
+
+%let PS_CONT = age ip_adm op_visits;
+%let PS_BIN  = sex_binary Race_NHB Race_Hisp Race_Other
+               idxyr_2016 idxyr_2017 idxyr_2018 idxyr_2019
+               cci_mi cci_chf cci_pvd cci_cvd cci_copd cci_dm cci_dmcx
+               cci_renal cci_malig cci_mets cci_liver_mild cci_liver_sev
+               ht_dx med_antipsych med_antidepressant med_beta;
+
+proc logistic data=cms.cohort_psweights desc;
+  class &PS_BIN / param=ref;
+  model Ami_1px = &PS_CONT &PS_BIN;
+  output out=ps_denom p=ps;                /* predicted P(treated) */
+  title 'Propensity score model: P(Amiloride | covariates)';
+run;
+
+
+/* Denominator d_e = P(E=e | X) */
+data ps_denom;
+  set ps_denom;
+  if Ami_1px=1 then d_e = ps;
+  else               d_e = 1-ps;
+  keep bene_id Ami_1px ps d_e;
+run;
+
+/* Numerator n_e = P(E=e)  (stabilization) */
+proc logistic data=cms.cohort_psweights desc;
+  model Ami_1px = ;                          /* intercept-only model */
+  output out=ps_num p=p_overall;
+run;
+
+data ps_num;
+  set ps_num;
+  if Ami_1px=1 then n_e = p_overall;
+  else               n_e = 1 - p_overall;
+  keep bene_id n_e;
+run;
+
+
+/* ----- Step 3. Merge + compute unstabilized/stabilized weights; trim 1st/99th ----- */
+
+proc sort data=cms.cohort_psweights; by bene_id; run;
+proc sort data=ps_denom;             by bene_id; run;
+proc sort data=ps_num;               by bene_id; run;
+
+data ipw_all;
+  merge cms.cohort_psweights(in=a) ps_denom(in=b) ps_num(in=c);
+  by bene_id;
+  if a;  /* keep cohort rows */
+
+  ipew  = 1 / d_e;
+  sipew = n_e * ipew;
+run;
+
+/* Inspect weight distributions (before trimming) */
+proc means data=ipw_all mean sum min max p1 p99;
+  var ipew sipew d_e n_e ps;
+run;
+
+/* Compute dynamic 1st/99th percentiles for trimming */
+proc univariate data=ipw_all noprint;
+  var sipew;
+  output out=_pct pctlpts=1 99 pctlpre=p_;
+run;
+
+data cms.ami_pd_psweighted;
+  if _n_=1 then set _pct;                 /* p_1, p_99 */
+  set ipw_all;
+  sipew_t = max(min(sipew, p_99), p_1);   /* trimmed stabilized weight */
+run;
+
+/* Post-trim diagnostics */
+proc means data=cms.ami_pd_psweighted mean sum min max p1 p99;
+  var sipew sipew_t;
+  class Ami_1px;
+run;
+
+
+/* ----- Step 4. Quick balance visuals (optional, style-matched) ----- */
+
+/* PS by arm boxplots, unweighted */
+proc sgplot data=cms.ami_pd_psweighted; 
+vbox ps / category=Ami_1px; 
+title 'PS by exposure (unweighted)'; 
+run;
+
+/* PS by arm boxplots, weighted (trimmed) */
+proc sgplot data=cms.ami_pd_psweighted; 
+vbox ps / category=Ami_1px weight=sipew_t; 
+title 'PS by exposure (weighted, trimmed)'; 
+run;
+
+/* PS by arm histograms, unweighted */
+proc sgplot data=cms.ami_pd_psweighted;
+  histogram ps / group=Ami_1px transparency=0.5;
+  density   ps / group=Ami_1px type=kernel;
+  xaxis min=0 max=1; 
+title 'PS distribution by exposure (unweighted)';
+run;
+
+/* PS by arm histograms, weighted (trimmed) */
+proc sgplot data=cms.ami_pd_psweighted;
+  histogram ps / group=Ami_1px transparency=0.5 weight=sipew_t;
+  density   ps / group=Ami_1px type=kernel    weight=sipew_t;
+  xaxis min=0 max=1; 
+title 'PS distribution by exposure (weighted, trimmed)';
+run;
+
+title;
+
+
+
+*******************************************************************************;
+* Program name      :	xx_primary_analysis_hazard_ratios
+* Author            :	Jamie Heyward
+* Date created      :	July 18 2023
+* Study             : 	
+* Purpose           :	Calculate hazard ratios for Amiloride and AD comparing treatment arms
+* Inputs            :	
+* Program completed : 	
+* Updated by        : Yingqi Wang
+*********************************************************************************;
+
+/***** ----- Step 5. Survival time & event (Amiloride & Parkinson) ----- *****/
+data cms.ami_pd_analysis;
+  set cms.ami_pd_psweighted;
+
+  /* Clean any dates past study end */
+  if medicare_death_dt  > '31DEC2019'd then medicare_death_dt  = .;
+  if mcare_disenroll_dt > '31DEC2019'd then mcare_disenroll_dt = .;
+  if pd_event_dt        > '31DEC2019'd then pd_event_dt        = .;
+
+/* ITT analysis: end of follow-up = earliest of study end, disenrollment, death, PD */
+  fu_end_date = min( admin_censor_dt
+                   , coalesce(medicare_death_dt,'31DEC9999'd)
+                   , coalesce(mcare_disenroll_dt,'31DEC9999'd)
+                   , coalesce(pd_event_dt,'31DEC9999'd) );
+  format index_dt fu_end_date pd_event_dt date9.;
+
+/* Time scale */
+  days_to_end_fu = fu_end_date - index_dt;
+
+  /* Event indicator: 1 = PD event, 0 = censored */
+  censor_flag_pd = (fu_end_date = pd_event_dt);
+
+  /* Drop rows with nonpositive follow-up */
+  if days_to_end_fu <= 0 then delete;
+run;
+
+
+/* QC: exposure-by-event table & follow-up distribution */
+proc freq data=cms.ami_pd_analysis;
+  tables Ami_1px*censor_flag_pd / norow nocol nopercent;
+run;
+
+proc means data=cms.ami_pd_analysis n mean p25 p50 p75 min max;
+  class Ami_1px;
+  var days_to_end_fu;
+run;
+
+
+/***** ------ Step 6. Cox PH models ----- *****/
+
+/* Unweighted Cox (crude HR) */
+proc phreg data=cms.ami_pd_analysis;
+  class Ami_1px(ref='0') / param=ref order=internal;
+  model days_to_end_fu*censor_flag_pd(0) = Ami_1px;
+  hazardratio 'Unweighted HR: Amiloride vs Other PS' Ami_1px / diff=ref cl=wald;
+  title 'Cox PH — Unweighted';
+run;
+
+/* 6b. IPTW-weighted Cox (trimmed) */
+proc phreg data=cms.ami_pd_analysis;
+  class Ami_1px(ref='0') / param=ref order=internal;
+  model days_to_end_fu*censor_flag_pd(0) = Ami_1px;
+  weight sipew_t / normalize;
+  hazardratio 'IPTW (trimmed) HR: Amiloride vs Other PS' Ami_1px / diff=ref cl=wald;
+  title 'Cox PH — IPTW (trimmed) weighted';
+run;
+
+
+/***** ----- Step 7. Proportional hazards diagnostics ----- *****/
+/* Schoenfeld residuals for Ami_1px under weighted model */
+proc phreg data=cms.ami_pd_analysis;
+  class Ami_1px(ref='0') / param=ref order=internal;
+  model days_to_end_fu*censor_flag_pd(0) = Ami_1px;
+  weight sipew_t;
+  output out=cms.schoen_pd ressch=ressch_Ami;
+  title 'PH diagnostics — Schoenfeld residuals (IPTW weighted)';
+run;
+
+proc sgplot data=cms.schoen_pd;
+  scatter x=days_to_end_fu y=ressch_Ami / markerattrs=(symbol=circlefilled);
+  loess   x=days_to_end_fu y=ressch_Ami / smooth=0.3;
+  refline 0 / axis=y;
+  xaxis label='Follow-up time (days)';
+  yaxis label='Schoenfeld residual (Ami_1px)';
+  title 'Schoenfeld residuals over time (Ami_1px)';
+run;
+
+
+/***** ===== Step 8. K-M curves (IPTW-weighted) ===== *****/
+
+ods graphics on;
+proc lifetest data=cms.ami_pd_analysis plots=survival(atrisk cb);
+  time days_to_end_fu*censor_flag_pd(0);
+  strata Ami_1px / order=internal;
+  weight sipew_t;
+  title 'IPTW-weighted Kaplan–Meier Curves: Amiloride vs Other PS (PD outcome)';
+run;
+
+
+
